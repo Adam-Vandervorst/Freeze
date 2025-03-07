@@ -9,14 +9,14 @@ pub struct LiquidVecRef<'alloc> { alloc: &'alloc mut BumpAlloc }
 impl <'alloc> LiquidVecRef<'alloc> {
     /// Consume the vector and produce a slice that can still be used; it's length is now fixed
     #[inline(always)]
-    pub fn freeze(self) -> &'alloc mut [u8] {
+    pub fn freeze(self) -> (&'alloc mut [u8], LiquidVecRef<'alloc>) {
         unsafe {
             let ret = std::ptr::slice_from_raw_parts_mut(self.alloc.top_base, self.alloc.top_size);
 
             self.alloc.top_base = self.alloc.top_base.add(self.alloc.top_size);
             self.alloc.top_size = 0;
 
-            &mut *ret
+            (&mut *ret, LiquidVecRef { alloc: self.alloc })
         }
     }
 
@@ -145,18 +145,18 @@ struct BumpAlloc {
 }
 
 #[repr(transparent)]
-pub struct BumpAllocRef {
-    ptr: *mut BumpAlloc
+pub struct BumpAllocRef<'a> {
+    ptr: &'a mut BumpAlloc
 }
 
-impl BumpAllocRef {
+impl <'a> BumpAllocRef<'a> {
     /// New Bump allocator with at most ~4GB of stuff in it
-    pub fn new() -> Self {
+    pub fn new() -> (Self, LiquidVecRef<'a>) {
         Self::new_with_address_space(32)
     }
 
     /// New Bump allocator with at most ~2^bits stuff in it
-    pub fn new_with_address_space(bits: u8) -> Self {
+    pub fn new_with_address_space(bits: u8) -> (Self, LiquidVecRef<'a>) {
         use libc::*;
         unsafe {
             let res = mmap(std::ptr::null_mut(), 1 << bits, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
@@ -174,15 +174,16 @@ impl BumpAllocRef {
                 top_size: 0,
             };
 
-            Self { ptr: res as *mut BumpAlloc }
+            (Self { ptr: (res as *mut BumpAlloc).as_mut().unwrap_unchecked() },
+             LiquidVecRef { alloc: (res as *mut BumpAlloc).as_mut().unwrap_unchecked() })
         }
     }
 
     /// Gets the (custom) Vec ref that's currently able to be modified
-    pub fn top(&self) -> LiquidVecRef {
+    pub unsafe fn top(&mut self) -> LiquidVecRef {
         unsafe {
             LiquidVecRef {
-                alloc: self.ptr.as_mut().unwrap_unchecked()
+                alloc: self.ptr
             }
         }
     }
@@ -190,21 +191,21 @@ impl BumpAllocRef {
     /// The full data range (concatenation) of all allocated vector data
     /// Unsafe because it aliases potential outstanding mutable references to parts of the data range
     pub unsafe fn data_range(&self) -> &[u8] {
-        let data_base = self.ptr.byte_add(size_of::<BumpAlloc>()) as *const u8;
+        let data_base = (self.ptr as *const _ as *const u8).byte_add(size_of::<BumpAlloc>()) as *const u8;
         std::slice::from_raw_parts(data_base, self.data_size())
     }
 
     /// The full mutable data range (concatenation) of all allocated vector data
     /// /// Unsafe because it aliases potential outstanding references to parts of the data range
     pub unsafe fn data_range_mut(&mut self) -> &mut [u8] {
-        let data_base = self.ptr.byte_add(size_of::<BumpAlloc>()) as *mut u8;
+        let data_base = (self.ptr as *mut _ as *mut u8).byte_add(size_of::<BumpAlloc>()) as *mut u8;
         std::slice::from_raw_parts_mut(data_base, self.data_size())
     }
 
     /// The total number of data bytes allocated over the lifetime of the allocator
     pub fn data_size(&self) -> usize {
         unsafe {
-            let data_base = self.ptr as usize + size_of::<BumpAlloc>();
+            let data_base = self.ptr as *const _ as usize + size_of::<BumpAlloc>();
             ((*self.ptr).top_base as usize - data_base) + (*self.ptr).top_size
         }
     }
@@ -222,7 +223,7 @@ impl BumpAllocRef {
             let last = (*self.ptr).top_base.add((*self.ptr).top_size);
             let page_size = libc::sysconf(libc::_SC_PAGESIZE) as usize;
             let fit = ((last as usize)/page_size + 1)*page_size;
-            let clearing = (*self.ptr).address_space - (fit - self.ptr as usize);
+            let clearing = (*self.ptr).address_space - (fit - self.ptr as *const _ as usize);
             // println!("{:?} (data_size={}, address_space={}, page_size={}) and performing munmap({:?}, {})", self.ptr as usize, self.data_size(), (*self.ptr).address_space, page_size, fit, clearing);
             // Don't remove. Both approaches work (and should keep working)
             // assert_eq!(libc::mremap(self.ptr as _, (*self.ptr).address_space, (fit - self.ptr as usize), 0) as *mut u8, self.ptr as *mut u8);
@@ -234,10 +235,10 @@ impl BumpAllocRef {
     }
 }
 
-impl Drop for BumpAllocRef {
+impl <'a> Drop for BumpAllocRef<'a> {
     fn drop(&mut self) {
         unsafe {
-            libc::munmap(self.ptr as _, (*self.ptr).address_space);
+            libc::munmap(self.ptr as *mut _ as _, (*self.ptr).address_space);
         }
     }
 }
@@ -248,10 +249,9 @@ mod tests {
 
     #[test]
     fn basis() {
-        let mut alloc = BumpAllocRef::new();
+        let (mut alloc, mut v1) = BumpAllocRef::new();
 
-        let s1: &[u8] = {
-            let mut v1: LiquidVecRef = alloc.top();
+        let (s1, mut v2) = {
             v1.extend_from_slice(&[1, 2, 3]);
             v1.extend_one(4);
             v1.extend_from_within(..3);
@@ -262,14 +262,13 @@ mod tests {
 
         assert_eq!(s1, [3, 2, 1, 4, 3, 2]);
 
-        let s2: &[u8] = {
-            let mut v1: LiquidVecRef = alloc.top();
-            v1.extend_from_slice(&[10, 20, 30]);
-            v1.extend_one(40);
-            v1.extend_from_within(..3);
-            v1.deref_mut().reverse();
-            v1.pop();
-            v1.freeze()
+        let (s2, v3) = {
+            v2.extend_from_slice(&[10, 20, 30]);
+            v2.extend_one(40);
+            v2.extend_from_within(..3);
+            v2.deref_mut().reverse();
+            v2.pop();
+            v2.freeze()
         };
 
         assert_eq!(s2, [30, 20, 10, 40, 30, 20]);
