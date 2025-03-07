@@ -9,7 +9,7 @@ repository = "https://github.com/Adam-Vandervorst/Freeze/"
 readme = "README.md"
 keywords = ["alloc", "vec", "slice", "mmap"]
 categories = ["memory-management", "data-structures"]
-include = ["Cargo.toml", "README.md", "LICENSE", ".gitignore", "src/*"]
+include = ["Cargo.toml", "README.md", "LICENSE", ".gitignore", "src/lib.rs"]
 
 [dependencies]
 libc = "0.2"

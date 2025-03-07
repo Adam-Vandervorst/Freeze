@@ -187,12 +187,16 @@ impl BumpAllocRef {
         }
     }
 
-    unsafe fn data_range(&self) -> &[u8] {
+    /// The full data range (concatenation) of all allocated vector data
+    /// Unsafe because it aliases potential outstanding mutable references to parts of the data range
+    pub unsafe fn data_range(&self) -> &[u8] {
         let data_base = self.ptr.byte_add(size_of::<BumpAlloc>()) as *const u8;
         std::slice::from_raw_parts(data_base, self.data_size())
     }
 
-    unsafe fn data_range_mut(&mut self) -> &mut [u8] {
+    /// The full mutable data range (concatenation) of all allocated vector data
+    /// /// Unsafe because it aliases potential outstanding references to parts of the data range
+    pub unsafe fn data_range_mut(&mut self) -> &mut [u8] {
         let data_base = self.ptr.byte_add(size_of::<BumpAlloc>()) as *mut u8;
         std::slice::from_raw_parts_mut(data_base, self.data_size())
     }
@@ -212,6 +216,7 @@ impl BumpAllocRef {
         }
     }
 
+    /// Disables the allocator, releases the unused address_space, contents are still accessible
     pub fn shrink_to_allocated(&self) {
         unsafe {
             let last = (*self.ptr).top_base.add((*self.ptr).top_size);
